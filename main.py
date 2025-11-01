@@ -1,7 +1,6 @@
 import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler, \
-    CallbackQueryHandler
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler, CallbackQueryHandler
 import json
 from datetime import datetime, timedelta
 import pandas as pd
@@ -16,14 +15,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Conversation states
+# Conversation states - UPDATED WITH NEW STATES
 AMOUNT, DESCRIPTION, MEAL_DATA, MEAL_CONFIRM = range(4)
 ADMIN_EXPENSE_MEMBER, ADMIN_EXPENSE_AMOUNT, ADMIN_EXPENSE_DESC = range(4, 7)
 EDIT_MEAL_SELECT, EDIT_MEAL_COUNT = range(7, 9)
+MEAL_MEMBER_SELECT, MEAL_COUNT_INPUT = range(9, 11)
 
 # Data storage file
 DATA_FILE = 'mess_fund_groups.json'
-
 
 class MessFundManager:
     def __init__(self):
@@ -59,7 +58,6 @@ class MessFundManager:
             }
             self.save_data()
         else:
-            # Update existing group with missing fields (backward compatibility)
             updated = False
             if 'meal_counts' not in self.data[group_id]:
                 self.data[group_id]['meal_counts'] = {}
@@ -168,6 +166,62 @@ class MessFundManager:
         group_id = str(group_id)
         self.init_group(group_id)
         return self.data[group_id].get('meal_data_submitted', False)
+
+    def get_member_wise_summary(self, group_id):
+        """Get detailed member-wise summary"""
+        group_id = str(group_id)
+        self.init_group(group_id)
+
+        expenses = self.get_current_month_expenses(group_id)
+        meal_data = self.get_current_month_meals(group_id)
+        members = self.data[group_id].get('members', {})
+
+        cost_per_meal = 0
+        if expenses and meal_data:
+            carry_forward = self.data[group_id].get('carry_forward', 0)
+            total_expenses = sum(e['amount'] for e in expenses)
+            total_with_carry = total_expenses + carry_forward
+            total_meals = sum(meal_data.values())
+            if total_meals > 0:
+                cost_per_meal = total_with_carry / total_meals
+
+        member_summary = {}
+
+        all_member_ids = set()
+        for expense in expenses:
+            all_member_ids.add(expense['added_by_id'])
+        all_member_ids.update(meal_data.keys())
+        all_member_ids.update(members.keys())
+
+        for uid in all_member_ids:
+            if uid in members:
+                name = members[uid]['name']
+                username = members[uid].get('username', '')
+            else:
+                name = f"User {uid}"
+                username = ""
+
+            member_expenses = [e for e in expenses if e['added_by_id'] == uid]
+            total_spent = sum(e['amount'] for e in member_expenses)
+            expense_count = len(member_expenses)
+
+            meals = meal_data.get(uid, 0)
+
+            owes = meals * cost_per_meal if cost_per_meal > 0 else 0
+            balance = total_spent - owes
+
+            member_summary[uid] = {
+                'name': name,
+                'username': username,
+                'total_spent': total_spent,
+                'expense_count': expense_count,
+                'expense_details': member_expenses,
+                'meals': meals,
+                'owes': owes,
+                'balance': balance
+            }
+
+        return member_summary
 
     def calculate_settlement(self, group_id):
         """Calculate settlement"""
@@ -315,7 +369,6 @@ class MessFundManager:
 
         return files
 
-
 # Initialize manager
 manager = MessFundManager()
 
@@ -323,6 +376,37 @@ manager = MessFundManager()
 bot_instance = None
 scheduler = None
 
+def get_main_menu_keyboard(is_admin=False):
+    """Generate main menu keyboard"""
+    keyboard = [
+        [InlineKeyboardButton("📊 Month Summary", callback_data="menu_summary"),
+         InlineKeyboardButton("👥 Members", callback_data="menu_members")],
+        [InlineKeyboardButton("💸 Add Expense", callback_data="menu_expense"),
+         InlineKeyboardButton("📈 My Stats", callback_data="menu_mystats")],
+        [InlineKeyboardButton("💰 Settlement", callback_data="menu_settlement"),
+         InlineKeyboardButton("🍽️ View Meals", callback_data="menu_viewmeals")],
+        [InlineKeyboardButton("📝 Add Meals", callback_data="menu_addmeals")]
+    ]
+
+    if is_admin:
+        keyboard.append([
+            InlineKeyboardButton("👑 Admin Menu", callback_data="menu_admin")
+        ])
+
+    keyboard.append([InlineKeyboardButton("❓ Help", callback_data="menu_help")])
+
+    return InlineKeyboardMarkup(keyboard)
+
+def get_admin_menu_keyboard():
+    """Generate admin menu keyboard"""
+    keyboard = [
+        [InlineKeyboardButton("💸 Add Member Expense", callback_data="admin_addexpense"),
+         InlineKeyboardButton("🍽️ Edit Meal Count", callback_data="admin_editmeal")],
+        [InlineKeyboardButton("🔄 Reset Month", callback_data="admin_reset"),
+         InlineKeyboardButton("📥 Export Data", callback_data="admin_export")],
+        [InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="menu_main")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
 
 async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """Check if user is admin"""
@@ -335,7 +419,6 @@ async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     except Exception as e:
         logger.error(f"Error checking admin status: {e}")
         return False
-
 
 async def check_meal_reminder():
     """Check if meal data reminder needed"""
@@ -350,16 +433,18 @@ async def check_meal_reminder():
         for group_id in active_groups:
             try:
                 if not manager.is_meal_data_submitted(group_id):
+                    keyboard = [[InlineKeyboardButton("📝 Add Meal Data", callback_data="menu_addmeals")]]
+                    reply_markup = InlineKeyboardMarkup(keyboard)
+
                     await bot_instance.send_message(
                         chat_id=int(group_id),
                         text="⚠️ *REMINDER: Meal Data Needed!*\n\n"
-                             "Only 3 days left in this month!\n\n"
-                             "Please submit meal counts using /addmeals",
-                        parse_mode='Markdown'
+                             "Only 3 days left in this month!",
+                        parse_mode='Markdown',
+                        reply_markup=reply_markup
                     )
             except Exception as e:
                 logger.error(f"Error sending reminder: {e}")
-
 
 async def check_month_end():
     """Check month end"""
@@ -373,12 +458,15 @@ async def check_month_end():
         for group_id in active_groups:
             try:
                 if not manager.is_meal_data_submitted(group_id):
+                    keyboard = [[InlineKeyboardButton("📝 Add Meal Data Now", callback_data="menu_addmeals")]]
+                    reply_markup = InlineKeyboardMarkup(keyboard)
+
                     await bot_instance.send_message(
                         chat_id=int(group_id),
                         text="⚠️ *MONTH END - NO MEAL DATA!*\n\n"
-                             "Cannot calculate settlement without meal data.\n\n"
-                             "Please use /addmeals now!",
-                        parse_mode='Markdown'
+                             "Cannot calculate settlement without meal data.",
+                        parse_mode='Markdown',
+                        reply_markup=reply_markup
                     )
                     continue
 
@@ -431,9 +519,8 @@ async def check_month_end():
             except Exception as e:
                 logger.error(f"Error processing group {group_id}: {e}")
 
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start"""
+    """Start command with button menu"""
     chat_type = update.effective_chat.type
 
     if chat_type == 'private':
@@ -441,49 +528,418 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🍽️ *Mess Fund Manager Bot*\n\n"
             "Perfect for hostel/PG mess management!\n\n"
             "📋 *Features:*\n"
-            "✅ Track expenses when members buy items\n"
-            "✅ Add meal counts at month end\n"
-            "✅ Automatic settlement calculation\n"
-            "✅ Fair cost distribution\n"
-            "✅ Auto reminders & reports\n"
-            "✅ Admin controls\n\n"
+            "✅ Track expenses\n"
+            "✅ Add meal counts\n"
+            "✅ Auto settlement\n"
+            "✅ Fair distribution\n"
+            "✅ Admin controls\n"
+            "✅ Member-wise summary\n\n"
             "Add me to your group to get started!",
             parse_mode='Markdown'
         )
     else:
         manager.init_group(update.effective_chat.id)
+
+        user_is_admin = await is_admin(update, context)
+
         await update.message.reply_text(
-            "👋 Hello! I'm your Mess Fund Manager.\n\n"
-            "✨ I'll send reminders and auto-settlement reports!\n\n"
-            "Use /help to see all commands."
+            "👋 *Welcome to Mess Fund Manager!*\n\n"
+            f"📅 Current Month: {datetime.now().strftime('%B %Y')}\n\n"
+            "Choose an option below:",
+            reply_markup=get_main_menu_keyboard(user_is_admin),
+            parse_mode='Markdown'
         )
 
+async def menu_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle menu button callbacks"""
+    query = update.callback_query
+    await query.answer()
+
+    callback_data = query.data
+
+    if callback_data.startswith("quick_expense_"):
+        await quick_expense_callback(update, context)
+        return
+
+    if callback_data == "menu_main":
+        user_is_admin = await is_admin(update, context)
+        await query.edit_message_text(
+            "🍽️ *Main Menu*\n\n"
+            "Choose an option:",
+            reply_markup=get_main_menu_keyboard(user_is_admin),
+            parse_mode='Markdown'
+        )
+
+    elif callback_data == "menu_help":
+        help_text = (
+            "🍽️ *Mess Fund Manager*\n\n"
+            "📝 *Daily Operations:*\n"
+            "• Type any message to get menu\n"
+            "• Type a number for quick expense\n"
+            "• Track your purchases\n"
+            "• Add meal counts at month end\n\n"
+            "📊 *Reports:*\n"
+            "• View summaries anytime\n"
+            "• Check member-wise details\n"
+            "• Auto settlement on last day\n\n"
+            "👑 *Admin Features:*\n"
+            "• Add expenses for any member\n"
+            "• Edit meal counts\n"
+            "• Manual reset\n"
+            "• Export data\n\n"
+            "🤖 *Automatic:*\n"
+            "• Reminder 3 days before month end\n"
+            "• Auto settlement calculation\n\n"
+            "💡 *Quick Tips:*\n"
+            "• Type 500 → Quick add ₹500 expense\n"
+            "• Any text → Shows menu\n"
+            "• Use buttons for easy navigation"
+        )
+
+        keyboard = [[InlineKeyboardButton("⬅️ Back to Menu", callback_data="menu_main")]]
+
+        await query.edit_message_text(
+            help_text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
+
+    elif callback_data == "menu_admin":
+        if not await is_admin(update, context):
+            await query.answer("⚠️ Admin only!", show_alert=True)
+            return
+
+        await query.edit_message_text(
+            "👑 *Admin Menu*\n\n"
+            "Select an admin action:",
+            reply_markup=get_admin_menu_keyboard(),
+            parse_mode='Markdown'
+        )
+
+    elif callback_data == "menu_expense":
+        keyboard = [[InlineKeyboardButton("⬅️ Back", callback_data="menu_main")]]
+        await query.edit_message_text(
+            "💸 *Add Your Expense*\n\n"
+            "💡 *Quick way:* Just type a number\n"
+            "Example: Type `500`\n\n"
+            "📝 *Or use:* /expense command",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
+
+    elif callback_data == "menu_summary":
+        await show_summary_from_button(update, context)
+
+    elif callback_data == "menu_members":
+        await show_members_from_button(update, context)
+
+    elif callback_data == "menu_mystats":
+        await show_mystats_from_button(update, context)
+
+    elif callback_data == "menu_settlement":
+        await show_settlement_from_button(update, context)
+
+    elif callback_data == "menu_viewmeals":
+        await show_viewmeals_from_button(update, context)
+
+    elif callback_data == "admin_addexpense":
+        if not await is_admin(update, context):
+            await query.answer("⚠️ Admin only!", show_alert=True)
+            return
+        keyboard = [[InlineKeyboardButton("⬅️ Back", callback_data="menu_admin")]]
+        await query.edit_message_text(
+            "👑 *Add Expense for Any Member*\n\n"
+            "Use command: /addexpense",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
+
+    elif callback_data == "admin_reset":
+        if not await is_admin(update, context):
+            await query.answer("⚠️ Admin only!", show_alert=True)
+            return
+        keyboard = [[InlineKeyboardButton("⬅️ Back", callback_data="menu_admin")]]
+        await query.edit_message_text(
+            "👑 *Reset Month*\n\n"
+            "Use command: /reset\n\n"
+            "⚠️ This will archive current data!",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
+
+    elif callback_data == "admin_export":
+        if not await is_admin(update, context):
+            await query.answer("⚠️ Admin only!", show_alert=True)
+            return
+        keyboard = [[InlineKeyboardButton("⬅️ Back", callback_data="menu_admin")]]
+        await query.edit_message_text(
+            "👑 *Export Data*\n\n"
+            "Use command: /export",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
+
+async def quick_expense_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle quick expense from number"""
+    query = update.callback_query
+    await query.answer()
+
+    amount = float(query.data.replace("quick_expense_", ""))
+
+    user = query.from_user
+    group_id = query.message.chat_id
+
+    context.user_data['quick_expense_amount'] = amount
+    context.user_data['quick_expense_group'] = group_id
+    context.user_data['quick_expense_user_id'] = user.id
+    context.user_data['quick_expense_user_name'] = user.first_name
+
+    await query.edit_message_text(
+        f"💸 *Quick Expense: ₹{amount}*\n\n"
+        f"📝 What did you buy?\n\n"
+        f"Reply with the description below:",
+        parse_mode='Markdown'
+    )
+
+async def show_summary_from_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show summary from button"""
+    query = update.callback_query
+    group_id = str(update.effective_chat.id)
+
+    expenses = manager.get_current_month_expenses(group_id)
+    meal_data = manager.get_current_month_meals(group_id)
+    carry = manager.data[group_id].get('carry_forward', 0)
+
+    total = sum(e['amount'] for e in expenses)
+    total_meals = sum(meal_data.values()) if meal_data else 0
+
+    text = f"📊 *Month Summary - {datetime.now().strftime('%B %Y')}*\n\n"
+
+    if carry != 0:
+        text += f"💰 Carry Forward: ₹{carry:.2f}\n"
+
+    text += f"💸 Total Expenses: ₹{total:.2f}\n"
+    text += f"📝 Expense Entries: {len(expenses)}\n"
+    text += f"🍽️ Total Meals: {total_meals}\n"
+
+    if total_meals > 0:
+        text += f"💵 Cost per Meal: ₹{(total+carry)/total_meals:.2f}\n"
+
+    if not manager.is_meal_data_submitted(group_id):
+        text += "\n⚠️ Meal data not submitted yet!"
+
+    keyboard = [[InlineKeyboardButton("⬅️ Back to Menu", callback_data="menu_main")]]
+
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
+
+async def show_members_from_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show members summary from button"""
+    query = update.callback_query
+    group_id = str(update.effective_chat.id)
+
+    member_summary = manager.get_member_wise_summary(group_id)
+
+    if not member_summary:
+        await query.answer("⚠️ No member data yet!", show_alert=True)
+        return
+
+    sorted_members = sorted(
+        member_summary.items(),
+        key=lambda x: x[1]['balance'],
+        reverse=True
+    )
+
+    text = f"👥 *MEMBER SUMMARY*\n"
+    text += f"📅 {datetime.now().strftime('%B %Y')}\n\n"
+
+    for uid, data in sorted_members:
+        text += f"👤 *{data['name']}*\n"
+        text += f"💸 ₹{data['total_spent']:.2f} | 🍽️ {data['meals']}\n"
+
+        if data['balance'] > 0:
+            text += f"✅ Gets: ₹{data['balance']:.2f}\n\n"
+        elif data['balance'] < 0:
+            text += f"⚠️ Pays: ₹{abs(data['balance']):.2f}\n\n"
+        else:
+            text += f"✔️ Settled\n\n"
+
+    text += f"━━━━━━━━━━━━━━\n"
+    text += f"📊 Total Members: {len(sorted_members)}"
+
+    keyboard = [[InlineKeyboardButton("⬅️ Back to Menu", callback_data="menu_main")]]
+
+    if len(text) > 4000:
+        await query.answer("📊 Sending full summary...", show_alert=False)
+
+        chunk_size = 3500
+        chunks = []
+        current_chunk = f"👥 *MEMBER SUMMARY - Part 1*\n📅 {datetime.now().strftime('%B %Y')}\n\n"
+
+        for i, (uid, data) in enumerate(sorted_members):
+            member_text = f"👤 *{data['name']}*\n"
+            member_text += f"💸 ₹{data['total_spent']:.2f} | 🍽️ {data['meals']}\n"
+
+            if data['balance'] > 0:
+                member_text += f"✅ Gets: ₹{data['balance']:.2f}\n\n"
+            elif data['balance'] < 0:
+                member_text += f"⚠️ Pays: ₹{abs(data['balance']):.2f}\n\n"
+            else:
+                member_text += f"✔️ Settled\n\n"
+
+            if len(current_chunk) + len(member_text) > chunk_size:
+                chunks.append(current_chunk)
+                current_chunk = f"👥 *MEMBER SUMMARY - Part {len(chunks) + 1}*\n\n" + member_text
+            else:
+                current_chunk += member_text
+
+        if current_chunk:
+            chunks.append(current_chunk)
+
+        await query.edit_message_text(
+            chunks[0],
+            parse_mode='Markdown'
+        )
+
+        for chunk in chunks[1:]:
+            await query.message.reply_text(
+                chunk,
+                parse_mode='Markdown'
+            )
+
+        await query.message.reply_text(
+            f"━━━━━━━━━━━━━━\n📊 Total Members: {len(sorted_members)}",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    else:
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
+
+async def show_mystats_from_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show my stats from button"""
+    query = update.callback_query
+
+    stats = manager.get_member_stats(
+        update.effective_chat.id,
+        update.effective_user.id
+    )
+
+    text = f"📊 *Your Stats - {datetime.now().strftime('%B %Y')}*\n\n"
+    text += f"👤 {update.effective_user.first_name}\n\n"
+    text += f"💰 Total Spent: ₹{stats['spent']:.2f}\n"
+    text += f"📝 Expenses Added: {stats['expense_count']}\n"
+    text += f"🍽️ Meals Consumed: {stats['meals']}"
+
+    keyboard = [[InlineKeyboardButton("⬅️ Back to Menu", callback_data="menu_main")]]
+
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
+
+async def show_settlement_from_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show settlement from button"""
+    query = update.callback_query
+    group_id = update.effective_chat.id
+
+    if not manager.is_meal_data_submitted(str(group_id)):
+        await query.answer("⚠️ Meal data not submitted yet!", show_alert=True)
+        return
+
+    result = manager.calculate_settlement(group_id)
+
+    if not result:
+        await query.answer("⚠️ No data available!", show_alert=True)
+        return
+
+    text = f"💰 *Settlement*\n\n"
+    text += f"💵 Per Meal: ₹{result['cost_per_meal']:.2f}\n\n"
+
+    for s in sorted(result['settlements'], key=lambda x: x['balance'], reverse=True)[:5]:
+        text += f"👤 {s['name']}\n"
+
+        if s['balance'] > 0:
+            text += f"✅ Gets: ₹{s['balance']:.2f}\n\n"
+        elif s['balance'] < 0:
+            text += f"⚠️ Pays: ₹{abs(s['balance']):.2f}\n\n"
+        else:
+            text += f"✔️ Settled\n\n"
+
+    keyboard = [[InlineKeyboardButton("⬅️ Back to Menu", callback_data="menu_main")]]
+
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
+
+async def show_viewmeals_from_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show meals from button"""
+    query = update.callback_query
+    group_id = str(update.effective_chat.id)
+
+    if not manager.is_meal_data_submitted(group_id):
+        await query.answer("⚠️ No meal data yet!", show_alert=True)
+        return
+
+    meal_data = manager.get_current_month_meals(group_id)
+    members = manager.data[group_id].get('members', {})
+
+    text = f"📊 *Meal Counts - {datetime.now().strftime('%B %Y')}*\n\n"
+
+    total = 0
+    for uid, count in list(meal_data.items())[:8]:
+        name = members.get(uid, {}).get('name', f'User {uid}')
+        text += f"• {name}: {count}\n"
+        total += count
+
+    if len(meal_data) > 8:
+        remaining = sum(list(meal_data.values())[8:])
+        text += f"\n...and more ({len(meal_data) - 8} members)"
+        total += remaining
+
+    text += f"\n🍽️ Total: {total} meals"
+
+    keyboard = [[InlineKeyboardButton("⬅️ Back to Menu", callback_data="menu_main")]]
+
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Help"""
-    help_text = (
-        "🍽️ *Mess Fund Manager Commands*\n\n"
-        "👤 *For All Members:*\n"
-        "/register - Register yourself\n"
-        "/expense - Add your expense\n"
-        "/mystats - View your stats\n"
-        "/summary - View month summary\n"
-        "/settlement - View settlement\n\n"
-        "📊 *Meal Management:*\n"
-        "/addmeals - Add meal counts (bulk)\n"
-        "/viewmeals - View meal data\n\n"
-        "👑 *Admin Only:*\n"
-        "/addexpense - Add expense for any member\n"
-        "/editmeal - Edit meal count for any member\n"
-        "/reset - Manual month reset\n"
-        "/export - Export data to CSV\n\n"
-        "🤖 *Auto Features:*\n"
-        "• Reminder 3 days before month end\n"
-        "• Auto settlement on last day\n"
-        "• Balance carry forward"
-    )
-    await update.message.reply_text(help_text, parse_mode='Markdown')
+    """Help command"""
+    user_is_admin = await is_admin(update, context)
 
+    await update.message.reply_text(
+        "🍽️ *Mess Fund Manager*\n\n"
+        "Use the menu buttons below to navigate!",
+        reply_markup=get_main_menu_keyboard(user_is_admin),
+        parse_mode='Markdown'
+    )
+
+async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show menu"""
+    if update.effective_chat.type == 'private':
+        await update.message.reply_text("⚠️ Add me to a group first!")
+        return
+
+    user_is_admin = await is_admin(update, context)
+
+    await update.message.reply_text(
+        "🍽️ *Menu*\n\n"
+        "Choose an option:",
+        reply_markup=get_main_menu_keyboard(user_is_admin),
+        parse_mode='Markdown'
+    )
 
 async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Register"""
@@ -496,9 +952,13 @@ async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     added = manager.add_member(group_id, user.first_name, user.id, user.username or '')
 
-    msg = f"✅ Welcome {user.first_name}! You're now registered." if added else f"ℹ️ You're already registered, {user.first_name}!"
-    await update.message.reply_text(msg)
+    user_is_admin = await is_admin(update, context)
+    msg = f"✅ Welcome {user.first_name}! You're now registered." if added else f"ℹ️ You're already registered!"
 
+    await update.message.reply_text(
+        msg,
+        reply_markup=get_main_menu_keyboard(user_is_admin)
+    )
 
 async def expense_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Expense start"""
@@ -519,7 +979,6 @@ async def expense_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"💸 Hi {user.first_name}! Enter the amount you spent (₹):")
     return AMOUNT
 
-
 async def amount_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Amount"""
     try:
@@ -528,12 +987,11 @@ async def amount_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             raise ValueError
 
         context.user_data['amount'] = amount
-        await update.message.reply_text('📝 What did you buy? (e.g., vegetables, rice, etc.)')
+        await update.message.reply_text('📝 What did you buy? (e.g., vegetables, rice)')
         return DESCRIPTION
     except ValueError:
         await update.message.reply_text('❌ Invalid amount! Please enter a valid number.')
         return AMOUNT
-
 
 async def description_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Description"""
@@ -544,24 +1002,21 @@ async def description_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     user_name = context.user_data['user_name']
 
     manager.add_expense(group_id, amount, description, user_name, user_id)
-    stats = manager.get_member_stats(group_id, user_id)
+
+    user_is_admin = await is_admin(update, context)
 
     await update.message.reply_text(
         f"✅ *Expense Recorded!*\n\n"
-        f"💸 Amount: ₹{amount:.2f}\n"
-        f"📝 Item: {description}\n"
-        f"👤 By: {user_name}\n\n"
-        f"📊 *Your Month Stats:*\n"
-        f"💰 Total Spent: ₹{stats['spent']:.2f}\n"
-        f"🍽️ Your Meals: {stats['meals']}",
+        f"💸 ₹{amount:.2f}\n"
+        f"📝 {description}\n"
+        f"👤 {user_name}",
+        reply_markup=get_main_menu_keyboard(user_is_admin),
         parse_mode='Markdown'
     )
 
     context.user_data.clear()
     return ConversationHandler.END
 
-
-# ADMIN FEATURE 1: Add expense for any member
 async def admin_add_expense_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin add expense for any member"""
     if update.effective_chat.type == 'private':
@@ -581,7 +1036,6 @@ async def admin_add_expense_start(update: Update, context: ContextTypes.DEFAULT_
 
     context.user_data['group_id'] = update.effective_chat.id
 
-    # Create buttons for member selection
     keyboard = []
     for uid, info in members.items():
         keyboard.append([InlineKeyboardButton(info['name'], callback_data=f"adminexp_{uid}")])
@@ -597,7 +1051,6 @@ async def admin_add_expense_start(update: Update, context: ContextTypes.DEFAULT_
     )
 
     return ADMIN_EXPENSE_MEMBER
-
 
 async def admin_expense_member_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle member selection for admin expense"""
@@ -625,7 +1078,6 @@ async def admin_expense_member_select(update: Update, context: ContextTypes.DEFA
 
     return ADMIN_EXPENSE_AMOUNT
 
-
 async def admin_expense_amount_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle amount for admin expense"""
     try:
@@ -640,7 +1092,6 @@ async def admin_expense_amount_handler(update: Update, context: ContextTypes.DEF
         await update.message.reply_text('❌ Invalid amount! Enter a valid number.')
         return ADMIN_EXPENSE_AMOUNT
 
-
 async def admin_expense_desc_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Complete admin expense entry"""
     description = update.message.text
@@ -651,20 +1102,67 @@ async def admin_expense_desc_handler(update: Update, context: ContextTypes.DEFAU
 
     manager.add_expense(group_id, amount, description, user_name, user_id)
 
+    user_is_admin = await is_admin(update, context)
+
     await update.message.reply_text(
         f"✅ *Expense Added by Admin!*\n\n"
         f"👤 Member: {user_name}\n"
         f"💸 Amount: ₹{amount:.2f}\n"
         f"📝 Item: {description}\n\n"
         f"✨ Added by: {update.effective_user.first_name}",
+        reply_markup=get_main_menu_keyboard(user_is_admin),
         parse_mode='Markdown'
     )
 
     context.user_data.clear()
     return ConversationHandler.END
 
+async def admin_edit_meal_from_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start admin edit meal from button"""
+    query = update.callback_query
+    await query.answer()
 
-# ADMIN FEATURE 2: Edit meal count
+    if not await is_admin(update, context):
+        await query.answer("⚠️ Admin only!", show_alert=True)
+        return ConversationHandler.END
+
+    group_id = str(update.effective_chat.id)
+
+    if not manager.is_meal_data_submitted(group_id):
+        keyboard = [[InlineKeyboardButton("⬅️ Back", callback_data="menu_admin")]]
+        await query.edit_message_text(
+            "⚠️ *No meal data submitted yet!*\n\n"
+            "Use 'Add Meals' button first to add meal data.",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
+        return ConversationHandler.END
+
+    meal_data = manager.get_current_month_meals(group_id)
+    members = manager.data[group_id].get('members', {})
+
+    context.user_data['group_id'] = update.effective_chat.id
+
+    keyboard = []
+    for uid, count in meal_data.items():
+        name = members.get(uid, {}).get('name', f'User {uid}')
+        keyboard.append([InlineKeyboardButton(
+            f"{name} (current: {count})",
+            callback_data=f"editmeal_{uid}"
+        )])
+    keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="editmeal_cancel")])
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await query.edit_message_text(
+        "👑 *Admin: Edit Meal Count*\n\n"
+        "Select member to edit:",
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
+
+    return EDIT_MEAL_SELECT
+
 async def admin_edit_meal_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin edit meal count"""
     if update.effective_chat.type == 'private':
@@ -686,7 +1184,6 @@ async def admin_edit_meal_start(update: Update, context: ContextTypes.DEFAULT_TY
 
     context.user_data['group_id'] = update.effective_chat.id
 
-    # Create buttons for member selection
     keyboard = []
     for uid, count in meal_data.items():
         name = members.get(uid, {}).get('name', f'User {uid}')
@@ -704,14 +1201,18 @@ async def admin_edit_meal_start(update: Update, context: ContextTypes.DEFAULT_TY
 
     return EDIT_MEAL_SELECT
 
-
 async def admin_edit_meal_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle member selection for meal edit"""
     query = update.callback_query
     await query.answer()
 
     if query.data == "editmeal_cancel":
-        await query.edit_message_text("❌ Cancelled.")
+        await query.edit_message_text(
+            "👑 *Admin Menu*\n\n"
+            "Select an admin action:",
+            reply_markup=get_admin_menu_keyboard(),
+            parse_mode='Markdown'
+        )
         context.user_data.clear()
         return ConversationHandler.END
 
@@ -737,7 +1238,6 @@ async def admin_edit_meal_select(update: Update, context: ContextTypes.DEFAULT_T
 
     return EDIT_MEAL_COUNT
 
-
 async def admin_edit_meal_count_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Update meal count"""
     try:
@@ -752,12 +1252,15 @@ async def admin_edit_meal_count_handler(update: Update, context: ContextTypes.DE
 
         manager.update_single_meal_count(group_id, user_id, new_count)
 
+        user_is_admin = await is_admin(update, context)
+
         await update.message.reply_text(
             f"✅ *Meal Count Updated!*\n\n"
             f"👤 Member: {user_name}\n"
             f"🍽️ Old count: {old_count}\n"
             f"🍽️ New count: {new_count}\n\n"
             f"✨ Updated by: {update.effective_user.first_name}",
+            reply_markup=get_main_menu_keyboard(user_is_admin),
             parse_mode='Markdown'
         )
 
@@ -768,9 +1271,60 @@ async def admin_edit_meal_count_handler(update: Update, context: ContextTypes.DE
         await update.message.reply_text('❌ Invalid! Enter a valid number (0 or more).')
         return EDIT_MEAL_COUNT
 
+async def add_meals_from_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start meal entry from menu button"""
+    query = update.callback_query
+    await query.answer()
+
+    if update.effective_chat.type == 'private':
+        await query.answer("⚠️ This works in groups only!", show_alert=True)
+        return ConversationHandler.END
+
+    group_id = update.effective_chat.id
+    user = query.from_user
+
+    context.user_data['group_id'] = group_id
+    context.user_data['submitted_by'] = user.first_name
+    context.user_data['meal_data_collection'] = {}
+
+    group_data = manager.data[str(group_id)]
+    members = group_data.get('members', {})
+
+    if not members:
+        await query.answer("⚠️ No members registered yet!", show_alert=True)
+        keyboard = [[InlineKeyboardButton("⬅️ Back", callback_data="menu_main")]]
+        await query.edit_message_text(
+            "⚠️ No members registered!\n\nMembers need to /register first.",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return ConversationHandler.END
+
+    keyboard = []
+    for uid, info in members.items():
+        keyboard.append([InlineKeyboardButton(
+            f"👤 {info['name']}",
+            callback_data=f"mealmember_{uid}"
+        )])
+
+    keyboard.append([InlineKeyboardButton("✅ Finish & Save", callback_data="mealmember_finish")])
+    keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="mealmember_cancel")])
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await query.edit_message_text(
+        f"📊 *Add Meal Counts - {datetime.now().strftime('%B %Y')}*\n\n"
+        f"👥 *Click on a member to add their meal count:*\n\n"
+        f"✅ = Already added\n"
+        f"👤 = Not added yet\n\n"
+        f"Click 'Finish & Save' when done!",
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
+
+    return MEAL_MEMBER_SELECT
 
 async def add_meals_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Add meals"""
+    """Add meals with button selection"""
     if update.effective_chat.type == 'private':
         await update.message.reply_text("⚠️ This command only works in groups!")
         return ConversationHandler.END
@@ -780,6 +1334,7 @@ async def add_meals_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data['group_id'] = group_id
     context.user_data['submitted_by'] = user.first_name
+    context.user_data['meal_data_collection'] = {}
 
     group_data = manager.data[str(group_id)]
     members = group_data.get('members', {})
@@ -791,139 +1346,167 @@ async def add_meals_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
 
-    member_list = "\n".join([f"• {info['name']}" for uid, info in members.items()])
+    keyboard = []
+    for uid, info in members.items():
+        if uid in context.user_data.get('meal_data_collection', {}):
+            keyboard.append([InlineKeyboardButton(
+                f"✅ {info['name']} - {context.user_data['meal_data_collection'][uid]} meals",
+                callback_data=f"mealmember_{uid}"
+            )])
+        else:
+            keyboard.append([InlineKeyboardButton(
+                f"👤 {info['name']}",
+                callback_data=f"mealmember_{uid}"
+            )])
 
-    await update.message.reply_text(
-        f"📊 *Add Meal Counts - {datetime.now().strftime('%B %Y')}*\n\n"
-        f"✅ *Registered Members:*\n{member_list}\n\n"
-        f"📝 *Enter meal counts in this format:*\n\n"
-        f"*Format:* `Name: count`\n\n"
-        f"*Example:*\n"
-        f"`Raj: 60\n"
-        f"Amit: 55\n"
-        f"Priya: 58\n"
-        f"Kumar: 62`\n\n"
-        f"Type /cancel to abort.",
-        parse_mode='Markdown'
-    )
+    keyboard.append([InlineKeyboardButton("✅ Finish & Save", callback_data="mealmember_finish")])
+    keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="mealmember_cancel")])
 
-    return MEAL_DATA
-
-
-async def meal_data_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Parse meal data and show confirmation"""
-    text = update.message.text
-    group_id = context.user_data['group_id']
-
-    meal_data = {}
-    matched_names = []
-    unmatched_names = []
-
-    lines = text.strip().split('\n')
-    group_data = manager.data[str(group_id)]
-    members = group_data.get('members', {})
-
-    for line in lines:
-        if ':' not in line:
-            continue
-
-        parts = line.split(':', 1)
-        identifier = parts[0].strip()
-
-        try:
-            count = int(parts[1].strip())
-            if count < 0:
-                raise ValueError
-
-            found = False
-            matched_member_name = None
-
-            # Try to match by user_id
-            if identifier in members:
-                meal_data[identifier] = count
-                matched_member_name = members[identifier]['name']
-                found = True
-            else:
-                # Try to match by name (case-insensitive)
-                for uid, info in members.items():
-                    if info['name'].lower() == identifier.lower():
-                        meal_data[uid] = count
-                        matched_member_name = info['name']
-                        found = True
-                        break
-
-            if found:
-                matched_names.append(f"{matched_member_name}: {count}")
-            else:
-                unmatched_names.append(f"{identifier}: {count}")
-
-        except ValueError:
-            unmatched_names.append(f"{identifier}: Invalid count")
-
-    if not meal_data:
-        await update.message.reply_text(
-            "❌ *No valid entries found!*\n\n"
-            "Please check:\n"
-            "• Correct spelling of names\n"
-            "• Format: `Name: count`\n"
-            "• Valid numbers only\n\n"
-            "Try again or type /cancel",
-            parse_mode='Markdown'
-        )
-        return MEAL_DATA
-
-    # Store parsed data for confirmation
-    context.user_data['parsed_meal_data'] = meal_data
-
-    # Build confirmation message
-    confirmation_text = "📋 *Please Confirm Meal Data*\n\n"
-
-    if matched_names:
-        confirmation_text += "✅ *Matched Members:*\n"
-        for entry in matched_names:
-            confirmation_text += f"• {entry}\n"
-        confirmation_text += f"\n🍽️ Total Meals: {sum(meal_data.values())}\n"
-
-    if unmatched_names:
-        confirmation_text += "\n⚠️ *Not Found (will be ignored):*\n"
-        for entry in unmatched_names:
-            confirmation_text += f"• {entry}\n"
-        confirmation_text += "\n💡 *Tip:* Check spelling against registered members list"
-
-    confirmation_text += "\n\n*Is this correct?*"
-
-    # Create inline keyboard for confirmation
-    keyboard = [
-        [
-            InlineKeyboardButton("✅ Yes, Save", callback_data="meal_confirm_yes"),
-            InlineKeyboardButton("❌ No, Re-enter", callback_data="meal_confirm_no")
-        ]
-    ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     await update.message.reply_text(
-        confirmation_text,
+        f"📊 *Add Meal Counts - {datetime.now().strftime('%B %Y')}*\n\n"
+        f"👥 *Click on a member to add their meal count:*\n\n"
+        f"✅ = Already added\n"
+        f"👤 = Not added yet\n\n"
+        f"Click 'Finish & Save' when done!",
         reply_markup=reply_markup,
         parse_mode='Markdown'
     )
 
-    return MEAL_CONFIRM
+    return MEAL_MEMBER_SELECT
 
-
-async def meal_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle meal confirmation"""
+async def meal_member_select_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle member selection for meal count"""
     query = update.callback_query
     await query.answer()
 
-    if query.data == "meal_confirm_yes":
-        # Save the data
+    if query.data == "mealmember_cancel":
+        await query.edit_message_text("❌ Cancelled.")
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    if query.data == "mealmember_finish":
+        meal_data = context.user_data.get('meal_data_collection', {})
+
+        if not meal_data:
+            await query.answer("⚠️ Please add at least one member's meal count!", show_alert=True)
+            return MEAL_MEMBER_SELECT
+
+        group_id = str(context.user_data['group_id'])
+        members = manager.data[group_id].get('members', {})
+
+        text = "📋 *Confirm Meal Data*\n\n"
+        total_meals = 0
+        for uid, count in meal_data.items():
+            name = members.get(uid, {}).get('name', f'User {uid}')
+            text += f"• {name}: {count} meals\n"
+            total_meals += count
+
+        text += f"\n🍽️ *Total Meals: {total_meals}*\n\n"
+        text += "*Is this correct?*"
+
+        keyboard = [
+            [
+                InlineKeyboardButton("✅ Yes, Save", callback_data="mealfinish_yes"),
+                InlineKeyboardButton("❌ No, Edit", callback_data="mealfinish_no")
+            ]
+        ]
+
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
+
+        return MEAL_CONFIRM
+
+    user_id = query.data.replace("mealmember_", "")
+    group_id = str(context.user_data['group_id'])
+    member_name = manager.data[group_id]['members'][user_id]['name']
+
+    context.user_data['current_member_id'] = user_id
+    context.user_data['current_member_name'] = member_name
+
+    existing_count = context.user_data['meal_data_collection'].get(user_id, None)
+
+    if existing_count:
+        await query.edit_message_text(
+            f"👤 *{member_name}*\n\n"
+            f"Current meal count: *{existing_count}*\n\n"
+            f"Enter new meal count:",
+            parse_mode='Markdown'
+        )
+    else:
+        await query.edit_message_text(
+            f"👤 *{member_name}*\n\n"
+            f"Enter meal count for this member:",
+            parse_mode='Markdown'
+        )
+
+    return MEAL_COUNT_INPUT
+
+async def meal_count_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle meal count input"""
+    try:
+        count = int(update.message.text)
+        if count < 0:
+            raise ValueError
+
+        user_id = context.user_data['current_member_id']
+        member_name = context.user_data['current_member_name']
+
+        context.user_data['meal_data_collection'][user_id] = count
+
+        group_id = str(context.user_data['group_id'])
+        members = manager.data[group_id].get('members', {})
+
+        keyboard = []
+        for uid, info in members.items():
+            if uid in context.user_data['meal_data_collection']:
+                keyboard.append([InlineKeyboardButton(
+                    f"✅ {info['name']} - {context.user_data['meal_data_collection'][uid]} meals",
+                    callback_data=f"mealmember_{uid}"
+                )])
+            else:
+                keyboard.append([InlineKeyboardButton(
+                    f"👤 {info['name']}",
+                    callback_data=f"mealmember_{uid}"
+                )])
+
+        keyboard.append([InlineKeyboardButton("✅ Finish & Save", callback_data="mealmember_finish")])
+        keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="mealmember_cancel")])
+
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await update.message.reply_text(
+            f"✅ *Added: {member_name} - {count} meals*\n\n"
+            f"📊 Progress: {len(context.user_data['meal_data_collection'])}/{len(members)} members\n\n"
+            f"Click another member to continue, or 'Finish & Save':",
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+        return MEAL_MEMBER_SELECT
+
+    except ValueError:
+        await update.message.reply_text(
+            '❌ Invalid number! Please enter a valid meal count (0 or more).'
+        )
+        return MEAL_COUNT_INPUT
+
+async def meal_finish_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle final confirmation"""
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "mealfinish_yes":
         group_id = context.user_data['group_id']
         submitted_by = context.user_data['submitted_by']
-        meal_data = context.user_data['parsed_meal_data']
+        meal_data = context.user_data['meal_data_collection']
 
         manager.set_meal_counts(group_id, meal_data, submitted_by)
 
-        # Generate success message
         group_data = manager.data[str(group_id)]
         members = group_data.get('members', {})
 
@@ -939,85 +1522,49 @@ async def meal_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TY
             total_meals += count
 
         text += f"\n🍽️ *Total Meals: {total_meals}*"
-        text += f"\n\n💡 Use /settlement to view calculations"
 
-        await query.edit_message_text(text, parse_mode='Markdown')
+        keyboard = [[InlineKeyboardButton("📱 Main Menu", callback_data="menu_main")]]
+
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
 
         context.user_data.clear()
         return ConversationHandler.END
 
-    elif query.data == "meal_confirm_no":
-        # Ask to re-enter
+    elif query.data == "mealfinish_no":
+        group_id = str(context.user_data['group_id'])
+        members = manager.data[group_id].get('members', {})
+
+        keyboard = []
+        for uid, info in members.items():
+            if uid in context.user_data['meal_data_collection']:
+                keyboard.append([InlineKeyboardButton(
+                    f"✅ {info['name']} - {context.user_data['meal_data_collection'][uid]} meals",
+                    callback_data=f"mealmember_{uid}"
+                )])
+            else:
+                keyboard.append([InlineKeyboardButton(
+                    f"👤 {info['name']}",
+                    callback_data=f"mealmember_{uid}"
+                )])
+
+        keyboard.append([InlineKeyboardButton("✅ Finish & Save", callback_data="mealmember_finish")])
+        keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="mealmember_cancel")])
+
         await query.edit_message_text(
-            "🔄 *Please re-enter meal data*\n\n"
-            "Make sure to check spelling!\n\n"
-            "Format: `Name: count`\n\n"
-            "Or type /cancel to abort",
+            f"📊 *Edit Meal Counts*\n\n"
+            f"Click on a member to update their count:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode='Markdown'
         )
-        return MEAL_DATA
 
-
-async def view_meals(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """View meals"""
-    if update.effective_chat.type == 'private':
-        await update.message.reply_text("⚠️ This command only works in groups!")
-        return
-
-    group_id = str(update.effective_chat.id)
-
-    if not manager.is_meal_data_submitted(group_id):
-        await update.message.reply_text(
-            "⚠️ No meal data submitted yet for this month!\n\n"
-            "Use /addmeals to add meal counts."
-        )
-        return
-
-    meal_data = manager.get_current_month_meals(group_id)
-    members = manager.data[group_id].get('members', {})
-
-    text = f"📊 *Meal Counts - {datetime.now().strftime('%B %Y')}*\n\n"
-
-    total = 0
-    for uid, count in meal_data.items():
-        name = members.get(uid, {}).get('name', f'User {uid}')
-        text += f"• {name}: {count} meals\n"
-        total += count
-
-    text += f"\n🍽️ *Total: {total} meals*"
-
-    # Show submission info
-    month_data = manager.data[group_id]['meal_counts'].get(datetime.now().strftime('%Y-%m'), {})
-    if 'submitted_by' in month_data:
-        text += f"\n\n✅ Submitted by: {month_data['submitted_by']}"
-        text += f"\n📅 Date: {month_data['submitted_date']}"
-
-    await update.message.reply_text(text, parse_mode='Markdown')
-
-
-async def my_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Stats"""
-    if update.effective_chat.type == 'private':
-        await update.message.reply_text("⚠️ This command only works in groups!")
-        return
-
-    stats = manager.get_member_stats(
-        update.effective_chat.id,
-        update.effective_user.id
-    )
-
-    await update.message.reply_text(
-        f"📊 *Your Stats - {datetime.now().strftime('%B %Y')}*\n\n"
-        f"👤 {update.effective_user.first_name}\n\n"
-        f"💰 Total Spent: ₹{stats['spent']:.2f}\n"
-        f"📝 Expenses Added: {stats['expense_count']}\n"
-        f"🍽️ Meals Consumed: {stats['meals']}",
-        parse_mode='Markdown'
-    )
-
+        return MEAL_MEMBER_SELECT
 
 async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Summary"""
+    """Summary command"""
     if update.effective_chat.type == 'private':
         await update.message.reply_text("⚠️ This command only works in groups!")
         return
@@ -1041,16 +1588,101 @@ async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text += f"🍽️ Total Meals: {total_meals}\n"
 
     if total_meals > 0:
-        text += f"💵 Cost per Meal: ₹{(total + carry) / total_meals:.2f}\n"
+        text += f"💵 Cost per Meal: ₹{(total+carry)/total_meals:.2f}\n"
 
     if not manager.is_meal_data_submitted(group_id):
         text += "\n⚠️ Meal data not submitted yet!"
 
-    await update.message.reply_text(text, parse_mode='Markdown')
+    user_is_admin = await is_admin(update, context)
 
+    await update.message.reply_text(
+        text,
+        reply_markup=get_main_menu_keyboard(user_is_admin),
+        parse_mode='Markdown'
+    )
+
+async def members_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Members command"""
+    if update.effective_chat.type == 'private':
+        await update.message.reply_text("⚠️ This command only works in groups!")
+        return
+
+    group_id = str(update.effective_chat.id)
+    member_summary = manager.get_member_wise_summary(group_id)
+
+    if not member_summary:
+        await update.message.reply_text("⚠️ No member data available yet!")
+        return
+
+    sorted_members = sorted(
+        member_summary.items(),
+        key=lambda x: x[1]['balance'],
+        reverse=True
+    )
+
+    text = f"👥 *MEMBER SUMMARY*\n"
+    text += f"📅 {datetime.now().strftime('%B %Y')}\n\n"
+
+    for uid, data in sorted_members:
+        text += f"👤 *{data['name']}*\n"
+        text += f"💸 ₹{data['total_spent']:.2f} | 🍽️ {data['meals']}\n"
+
+        if data['balance'] > 0:
+            text += f"✅ Gets: ₹{data['balance']:.2f}\n\n"
+        elif data['balance'] < 0:
+            text += f"⚠️ Pays: ₹{abs(data['balance']):.2f}\n\n"
+        else:
+            text += f"✔️ Settled\n\n"
+
+    text += f"━━━━━━━━━━━━━━\n"
+    text += f"📊 Total Members: {len(sorted_members)}"
+
+    user_is_admin = await is_admin(update, context)
+
+    if len(text) > 4000:
+        chunk_size = 3500
+        chunks = []
+        current_chunk = f"👥 *MEMBER SUMMARY - Part 1*\n📅 {datetime.now().strftime('%B %Y')}\n\n"
+
+        for uid, data in sorted_members:
+            member_text = f"👤 *{data['name']}*\n"
+            member_text += f"💸 ₹{data['total_spent']:.2f} | 🍽️ {data['meals']}\n"
+
+            if data['balance'] > 0:
+                member_text += f"✅ Gets: ₹{data['balance']:.2f}\n\n"
+            elif data['balance'] < 0:
+                member_text += f"⚠️ Pays: ₹{abs(data['balance']):.2f}\n\n"
+            else:
+                member_text += f"✔️ Settled\n\n"
+
+            if len(current_chunk) + len(member_text) > chunk_size:
+                chunks.append(current_chunk)
+                current_chunk = f"👥 *MEMBER SUMMARY - Part {len(chunks) + 1}*\n\n" + member_text
+            else:
+                current_chunk += member_text
+
+        if current_chunk:
+            chunks.append(current_chunk)
+
+        for chunk in chunks:
+            await update.message.reply_text(
+                chunk,
+                parse_mode='Markdown'
+            )
+
+        await update.message.reply_text(
+            f"━━━━━━━━━━━━━━\n📊 Total Members: {len(sorted_members)}",
+            reply_markup=get_main_menu_keyboard(user_is_admin)
+        )
+    else:
+        await update.message.reply_text(
+            text,
+            reply_markup=get_main_menu_keyboard(user_is_admin),
+            parse_mode='Markdown'
+        )
 
 async def settlement(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Settlement"""
+    """Settlement command"""
     if update.effective_chat.type == 'private':
         await update.message.reply_text("⚠️ This command only works in groups!")
         return
@@ -1067,10 +1699,7 @@ async def settlement(update: Update, context: ContextTypes.DEFAULT_TYPE):
     result = manager.calculate_settlement(group_id)
 
     if not result:
-        await update.message.reply_text(
-            "⚠️ No data available for settlement calculation!\n\n"
-            "Make sure both expenses and meals are recorded."
-        )
+        await update.message.reply_text("⚠️ No data available!")
         return
 
     text = f"💰 *Settlement Calculation*\n\n"
@@ -1090,7 +1719,6 @@ async def settlement(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += f"👤 *{s['name']}*\n"
         text += f"   💸 Spent: ₹{s['spent']:.2f}\n"
         text += f"   🍽️ Meals: {s['meals']}\n"
-        text += f"   💵 Owes: ₹{s['owes']:.2f}\n"
 
         if s['balance'] > 0:
             text += f"   ✅ Gets Back: ₹{s['balance']:.2f}\n\n"
@@ -1099,41 +1727,51 @@ async def settlement(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             text += f"   ✔️ Settled\n\n"
 
-    await update.message.reply_text(text, parse_mode='Markdown')
+    user_is_admin = await is_admin(update, context)
 
+    await update.message.reply_text(
+        text,
+        reply_markup=get_main_menu_keyboard(user_is_admin),
+        parse_mode='Markdown'
+    )
 
 async def reset_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Reset"""
+    """Reset month command"""
     if update.effective_chat.type == 'private':
         await update.message.reply_text("⚠️ This command only works in groups!")
         return
 
     if not await is_admin(update, context):
-        await update.message.reply_text("⚠️ Only group admins can reset the month!")
+        await update.message.reply_text("⚠️ Only admins can reset the month!")
         return
 
     group_id = update.effective_chat.id
     settlement = manager.reset_month(group_id)
+
+    user_is_admin = True
 
     if settlement:
         await update.message.reply_text(
             f"✅ Month has been archived!\n\n"
             f"Settlement for {settlement['month']} saved.\n"
             f"Balance ₹{settlement.get('remaining', 0):.2f} carried forward.\n\n"
-            f"Starting fresh for the new month!"
+            f"Starting fresh for the new month!",
+            reply_markup=get_main_menu_keyboard(user_is_admin)
         )
     else:
-        await update.message.reply_text("✅ Month reset! No data to archive.")
-
+        await update.message.reply_text(
+            "✅ Month reset! No data to archive.",
+            reply_markup=get_main_menu_keyboard(user_is_admin)
+        )
 
 async def export_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Export"""
+    """Export data command"""
     if update.effective_chat.type == 'private':
         await update.message.reply_text("⚠️ This command only works in groups!")
         return
 
     if not await is_admin(update, context):
-        await update.message.reply_text("⚠️ Only group admins can export data!")
+        await update.message.reply_text("⚠️ Only admins can export data!")
         return
 
     group_id = update.effective_chat.id
@@ -1153,34 +1791,104 @@ async def export_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 filename=file
             )
 
-        await update.message.reply_text("✅ Data exported successfully!")
+        user_is_admin = True
+        await update.message.reply_text(
+            "✅ Data exported successfully!",
+            reply_markup=get_main_menu_keyboard(user_is_admin)
+        )
     except Exception as e:
         logger.error(f"Export error: {e}")
         await update.message.reply_text(f"❌ Export failed: {str(e)}")
 
+async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle any text message and show menu or quick expense"""
+    if update.effective_chat.type == 'private':
+        await update.message.reply_text(
+            "👋 Hi! Add me to a group to manage mess funds!",
+            parse_mode='Markdown'
+        )
+        return
+
+    if 'quick_expense_amount' in context.user_data:
+        amount = context.user_data['quick_expense_amount']
+        group_id = context.user_data['quick_expense_group']
+        user_id = context.user_data['quick_expense_user_id']
+        user_name = context.user_data['quick_expense_user_name']
+        description = update.message.text
+
+        manager.add_expense(group_id, amount, description, user_name, user_id)
+
+        user_is_admin = await is_admin(update, context)
+
+        await update.message.reply_text(
+            f"✅ *Expense Recorded!*\n\n"
+            f"💸 ₹{amount:.2f}\n"
+            f"📝 {description}\n"
+            f"👤 {user_name}",
+            reply_markup=get_main_menu_keyboard(user_is_admin),
+            parse_mode='Markdown'
+        )
+
+        context.user_data.clear()
+        return
+
+    try:
+        amount = float(update.message.text)
+        if amount > 0:
+            user = update.effective_user
+            group_id = update.effective_chat.id
+
+            manager.add_member(group_id, user.first_name, user.id, user.username or '')
+
+            keyboard = [
+                [InlineKeyboardButton("💸 Yes, Add Expense", callback_data=f"quick_expense_{amount}")],
+                [InlineKeyboardButton("📱 Show Menu", callback_data="menu_main")]
+            ]
+
+            await update.message.reply_text(
+                f"💰 Add expense of ₹{amount}?",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return
+    except:
+        pass
+
+    user_is_admin = await is_admin(update, context)
+
+    await update.message.reply_text(
+        "📱 *Menu*",
+        reply_markup=get_main_menu_keyboard(user_is_admin),
+        parse_mode='Markdown'
+    )
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cancel"""
     context.user_data.clear()
-    await update.message.reply_text("❌ Operation cancelled.")
+
+    user_is_admin = False
+    try:
+        user_is_admin = await is_admin(update, context)
+    except:
+        pass
+
+    await update.message.reply_text(
+        "❌ Cancelled.",
+        reply_markup=get_main_menu_keyboard(user_is_admin)
+    )
     return ConversationHandler.END
 
-
 async def post_init(application: Application):
-    """Initialize scheduler after bot starts"""
+    """Initialize scheduler"""
     global bot_instance, scheduler
 
     bot_instance = application.bot
 
     scheduler = AsyncIOScheduler()
-    # Meal reminder at 10 AM daily
     scheduler.add_job(check_meal_reminder, 'cron', hour=10, minute=0)
-    # Month end check at 11:59 PM daily
     scheduler.add_job(check_month_end, 'cron', hour=23, minute=59)
     scheduler.start()
 
-    logger.info("✅ Scheduler started successfully!")
-
+    logger.info("✅ Scheduler started!")
 
 def main():
     """Main"""
@@ -1193,7 +1901,6 @@ def main():
         .build()
     )
 
-    # Regular expense handler
     expense_handler = ConversationHandler(
         entry_points=[CommandHandler('expense', expense_start)],
         states={
@@ -1203,7 +1910,6 @@ def main():
         fallbacks=[CommandHandler('cancel', cancel)]
     )
 
-    # Admin add expense handler
     admin_expense_handler = ConversationHandler(
         entry_points=[CommandHandler('addexpense', admin_add_expense_start)],
         states={
@@ -1214,9 +1920,11 @@ def main():
         fallbacks=[CommandHandler('cancel', cancel)]
     )
 
-    # Admin edit meal handler
     admin_edit_meal_handler = ConversationHandler(
-        entry_points=[CommandHandler('editmeal', admin_edit_meal_start)],
+        entry_points=[
+            CommandHandler('editmeal', admin_edit_meal_start),
+            CallbackQueryHandler(admin_edit_meal_from_button, pattern='^admin_editmeal$')
+        ],
         states={
             EDIT_MEAL_SELECT: [CallbackQueryHandler(admin_edit_meal_select, pattern='^editmeal_')],
             EDIT_MEAL_COUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_edit_meal_count_handler)],
@@ -1224,38 +1932,48 @@ def main():
         fallbacks=[CommandHandler('cancel', cancel)]
     )
 
-    # Meal handler with confirmation
     meal_handler = ConversationHandler(
-        entry_points=[CommandHandler('addmeals', add_meals_start)],
+        entry_points=[
+            CommandHandler('addmeals', add_meals_start),
+            CallbackQueryHandler(add_meals_from_menu, pattern='^menu_addmeals$')
+        ],
         states={
-            MEAL_DATA: [MessageHandler(filters.TEXT & ~filters.COMMAND, meal_data_handler)],
-            MEAL_CONFIRM: [CallbackQueryHandler(meal_confirm_callback, pattern='^meal_confirm_')]
+            MEAL_MEMBER_SELECT: [CallbackQueryHandler(meal_member_select_handler, pattern='^mealmember_')],
+            MEAL_COUNT_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, meal_count_input_handler)],
+            MEAL_CONFIRM: [CallbackQueryHandler(meal_finish_callback, pattern='^mealfinish_')]
         },
         fallbacks=[CommandHandler('cancel', cancel)]
     )
 
     application.add_handler(CommandHandler('start', start))
     application.add_handler(CommandHandler('help', help_command))
+    application.add_handler(CommandHandler('menu', menu_command))
     application.add_handler(CommandHandler('register', register))
     application.add_handler(expense_handler)
     application.add_handler(admin_expense_handler)
     application.add_handler(admin_edit_meal_handler)
     application.add_handler(meal_handler)
-    application.add_handler(CommandHandler('viewmeals', view_meals))
-    application.add_handler(CommandHandler('mystats', my_stats))
     application.add_handler(CommandHandler('summary', summary))
+    application.add_handler(CommandHandler('members', members_command))
     application.add_handler(CommandHandler('settlement', settlement))
     application.add_handler(CommandHandler('reset', reset_month))
     application.add_handler(CommandHandler('export', export_data))
 
+    application.add_handler(CallbackQueryHandler(menu_callback_handler, pattern='^(?!menu_addmeals$|admin_editmeal$)(menu_|admin_|quick_expense_)'))
+
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
+
     print('🤖 Mess Fund Manager Bot is running...')
-    print('📅 Meal reminder: Daily at 10:00 AM')
-    print('📅 Auto settlement: Daily at 11:59 PM')
+    print('🎯 Button-based interface enabled!')
+    print('📅 Auto settlement enabled')
     print('👑 Admin features enabled')
+    print('💬 Auto menu on any message!')
+    print('⚡ Quick expense feature enabled!')
+    print('✨ Button-based meal entry!')
+    print('✨ Button-based admin edit meal!')
     print('✨ All systems ready!')
 
     application.run_polling(allowed_updates=Update.ALL_TYPES)
-
 
 if __name__ == '__main__':
     main()
